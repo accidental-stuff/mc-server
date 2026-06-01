@@ -10,7 +10,7 @@ terraform {
 }
 
 provider "google" {
-  credentials = file("~/.config/gcp/terraform.json")
+  credentials = file(pathexpand("~/.config/gcp/terraform.json"))
 
   project = var.project_id
   region  = var.region
