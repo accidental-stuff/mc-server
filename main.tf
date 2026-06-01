@@ -54,4 +54,6 @@ resource "google_compute_instance" "minecraft" {
   metadata = {
     enable-oslogin = "TRUE"
   }
+
+  metadata_startup_script = file("${path.module}/scripts/startup.sh")
 }
