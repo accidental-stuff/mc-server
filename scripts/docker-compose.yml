@@ -1,0 +1,18 @@
+services:
+  crafty:
+    container_name: crafty_container
+    image: arcadiatechnology/crafty-4:latest
+    restart: always
+    environment:
+      - TZ=Asia/Kolkata
+    ports:
+      - "8443:8443"
+      - "8123:8123"
+      - "19132:19132/udp"
+      - "25500-25600:25500-25600"
+    volumes:
+      - /home/mcs/docker/backups:/crafty/backups
+      - /home/mcs/docker/logs:/crafty/logs
+      - /home/mcs/docker/servers:/crafty/servers
+      - /home/mcs/docker/config:/crafty/app/config
+      - /home/mcs/docker/import:/crafty/import

@@ -1,20 +1,9 @@
-#!/bin/bash
-set -e
+mkdir -p /home/mcs/docker/{backups,logs,servers,config,import}
 
-apt-get update
+cp /tmp/docker-compose.yml /home/mcs/docker-compose.yml
 
-apt-get install -y \
-docker.io \
-docker-compose \
-rclone \
-curl \
-unzip
+chown -R mcs:mcs /home/mcs
 
-systemctl enable docker
-systemctl start docker
+cd /home/mcs
 
-id -u mcs >/dev/null 2>&1 || useradd -m -s /bin/bash mcs
-
-mkdir -p /home/mcs/docker
-
-chown -R mcs:mcs /home/mcs/docker
+docker-compose up -d
