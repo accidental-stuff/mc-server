@@ -15,8 +15,16 @@ resource "google_compute_firewall" "minecraft" {
     protocol = "tcp"
     ports = [
       "22",
+      "8123",
       "8443",
       "25565"
+    ]
+  }
+
+  allow {
+    protocol = "udp"
+    ports = [
+      "19132"
     ]
   }
 
@@ -28,7 +36,7 @@ resource "google_compute_firewall" "minecraft" {
 resource "google_compute_instance" "minecraft" {
 
   name         = "minecraft"
-  machine_type = "n2-standard-2"
+  machine_type = "e2-standard-2"
   zone         = var.zone
 
   boot_disk {
@@ -55,5 +63,14 @@ resource "google_compute_instance" "minecraft" {
     enable-oslogin = "TRUE"
   }
 
-  metadata_startup_script = file("${path.module}/scripts/startup.sh")
+  metadata_startup_script = templatefile("${path.module}/scripts/wrapper.sh", {
+    startup_script = templatefile("${path.module}/scripts/startup.sh", {
+      r2_access_key  = var.r2_access_key
+      r2_secret_key  = var.r2_secret_key
+      r2_endpoint    = var.r2_endpoint
+      r2_bucket      = var.r2_bucket
+      docker_compose = file("${path.module}/scripts/docker-compose.yml")
+      mc_restore     = file("${path.module}/scripts/mc-restore.sh")
+    })
+  })
 }
