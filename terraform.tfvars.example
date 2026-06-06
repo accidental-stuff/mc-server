@@ -1,0 +1,16 @@
+project_id = "gcp-project-id"
+
+region = "us-central1"
+zone   = "us-central1-a"
+
+r2_access_key = "your-r2-access-key"
+r2_secret_key = "your-r2-secret-key"
+r2_endpoint   = "https://your-account-id.r2.cloudflarestorage.com"
+r2_bucket     = "mc-server-backup"
+
+cloudflare_api_token = "your-cloudflare-api-token"
+cloudflare_zone_id   = "your-cloudflare-zone-id"
+
+domain              = "example.com"
+minecraft_subdomain = "play"
+crafty_subdomain    = "crafty"
