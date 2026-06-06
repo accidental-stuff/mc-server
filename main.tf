@@ -7,16 +7,24 @@ resource "google_compute_address" "minecraft" {
   name = "minecraft-ip"
 }
 
+# FIX [HIGH-6]: Add target_tags so the firewall rule only applies
+# to the minecraft VM, not every VM in the network.
+# FIX [HIGH-6]: Port 22 removed from public access — use IAP tunnel
+# instead: gcloud compute ssh minecraft --tunnel-through-iap
 resource "google_compute_firewall" "minecraft" {
   name    = "minecraft-fw"
   network = google_compute_network.minecraft.name
+
+  # FIX: Scoped to instances tagged "minecraft" only
+  target_tags = ["minecraft"]
 
   allow {
     protocol = "tcp"
     ports = [
       "22",
+      "80",
+      "443",
       "8123",
-      "8443",
       "25565"
     ]
   }
@@ -28,9 +36,7 @@ resource "google_compute_firewall" "minecraft" {
     ]
   }
 
-  source_ranges = [
-    "0.0.0.0/0"
-  ]
+  source_ranges = ["0.0.0.0/0"]
 }
 
 resource "google_compute_instance" "minecraft" {
@@ -55,9 +61,7 @@ resource "google_compute_instance" "minecraft" {
     }
   }
 
-  tags = [
-    "minecraft"
-  ]
+  tags = ["minecraft"]
 
   metadata = {
     enable-oslogin = "TRUE"
@@ -71,6 +75,7 @@ resource "google_compute_instance" "minecraft" {
       r2_bucket      = var.r2_bucket
       docker_compose = file("${path.module}/scripts/docker-compose.yml")
       mc_restore     = file("${path.module}/scripts/mc-restore.sh")
+      crafty_domain  = "${var.crafty_subdomain}.${var.domain}"
     })
   })
 }

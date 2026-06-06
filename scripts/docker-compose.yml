@@ -6,7 +6,7 @@ services:
     environment:
       - TZ=Asia/Kolkata
     ports:
-      - "8443:8443"
+      - "127.0.0.1:8443:8443"
       - "8123:8123"
       - "19132:19132/udp"
       - "25565:25565"
@@ -16,3 +16,17 @@ services:
       - /home/mcs/docker/servers:/crafty/servers
       - /home/mcs/docker/config:/crafty/app/config
       - /home/mcs/docker/import:/crafty/import
+
+  caddy:
+    image: caddy:2
+    container_name: caddy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /home/mcs/docker/caddy/Caddyfile:/etc/caddy/Caddyfile
+      - /home/mcs/docker/caddy/data:/data
+      - /home/mcs/docker/caddy/config:/config
+    depends_on:
+      - crafty

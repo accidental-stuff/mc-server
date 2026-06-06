@@ -23,3 +23,24 @@ variable "r2_endpoint" {}
 variable "r2_bucket" {
   default = "mc-server-backup"
 }
+
+
+variable "cloudflare_api_token" {
+  sensitive = true
+}
+
+variable "cloudflare_zone_id" {}
+
+variable "domain" {
+  description = "Your root domain, e.g. example.com"
+}
+
+variable "minecraft_subdomain" {
+  default     = "play"
+  description = "Subdomain for Minecraft, e.g. play → play.example.com"
+}
+
+variable "crafty_subdomain" {
+  default     = "crafty"
+  description = "Subdomain for Crafty panel, e.g. crafty → crafty.example.com"
+}

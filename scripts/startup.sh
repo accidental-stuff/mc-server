@@ -8,10 +8,23 @@ echo "=========================================="
 echo "Starting deployment at $(date)"
 echo "=========================================="
 
+DEPLOY_MARKER="/home/mcs/.deployment-complete"
+if [ -f "$DEPLOY_MARKER" ]; then
+  echo "Deployment marker found — already deployed. Skipping."
+  echo "If you need to re-deploy, run: sudo rm $DEPLOY_MARKER && sudo bash /opt/mc-startup.sh"
+  exit 0
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -y
-apt-get install -y ca-certificates curl unzip jq awscli
+apt-get install -y ca-certificates curl unzip jq python3
+
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp/awscliv2-install
+/tmp/awscliv2-install/aws/install
+rm -rf /tmp/awscliv2.zip /tmp/awscliv2-install
+
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
 chmod a+r /etc/apt/keyrings/docker.asc
@@ -32,19 +45,45 @@ mkdir -p /home/mcs/docker/backups \
          /home/mcs/docker/import/upload \
          /home/mcs/docker/servers \
          /home/mcs/docker/config \
-         /home/mcs/docker/logs
+         /home/mcs/docker/logs \
+         /home/mcs/docker/caddy/data \
+         /home/mcs/docker/caddy/config
+
+if [ ! -f /swapfile ]; then
+  echo "Creating 2GB swapfile..."
+  fallocate -l 2G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  echo "Swap enabled."
+fi
+
+cat > /home/mcs/docker/caddy/Caddyfile << 'CADDYFILE'
+${crafty_domain} {
+    reverse_proxy crafty_container:8443 {
+        transport http {
+            tls_insecure_skip_verify
+        }
+
+        # Required for Crafty WSS — per https://docs.craftycontrol.com/pages/getting-started/proxies/
+        header_up Upgrade {http.request.header.Upgrade}
+        header_up Connection {http.request.header.Connection}
+        header_up X-Forwarded-Proto https
+        header_up X-Forwarded-For {remote_host}
+        header_up Host {host}
+
+        # Disable response buffering — required for live console output over WSS
+        flush_interval -1
+    }
+}
+CADDYFILE
 
 cat > /home/mcs/docker/docker-compose.yml << 'COMP'
 ${docker_compose}
 COMP
 
-# ─────────────────────────────────────────────────────────
-# DOWNLOAD BACKUP FROM R2 **BEFORE** STARTING DOCKER
-# This avoids the race condition where Crafty's container
-# manipulates the import/upload/ directory while we write.
-# ─────────────────────────────────────────────────────────
 if [ -n "${r2_access_key}" ] && [ -n "${r2_secret_key}" ]; then
-  # Check disk space — need at least 2GB free
   AVAIL_KB=$(df /home --output=avail | tail -1)
   if [ "$AVAIL_KB" -lt 2097152 ]; then
     echo "ERROR: Less than 2GB disk space available ($AVAIL_KB KB). Aborting."
@@ -58,36 +97,28 @@ if [ -n "${r2_access_key}" ] && [ -n "${r2_secret_key}" ]; then
     --endpoint-url "${r2_endpoint}" \
     || { echo "ERROR: Failed to download backup from R2. Aborting."; exit 1; }
 
-  # Verify the file actually exists on disk after download
   if [ ! -f "/home/mcs/docker/import/upload/latest.zip" ]; then
-    echo "ERROR: aws s3 cp reported success but file not found at /home/mcs/docker/import/upload/latest.zip. Aborting."
+    echo "ERROR: aws s3 cp reported success but file not found. Aborting."
     exit 1
   fi
 
-  # Verify zip is not empty or corrupt
   ZIPSIZE=$(stat -c%s "/home/mcs/docker/import/upload/latest.zip" 2>/dev/null || echo "0")
   if [ "$ZIPSIZE" -lt 1024 ]; then
-    echo "ERROR: Downloaded zip is too small ($ZIPSIZE bytes) — likely empty or corrupt. Aborting."
+    echo "ERROR: Downloaded zip is too small ($ZIPSIZE bytes). Aborting."
     exit 1
   fi
 
   unzip -t /home/mcs/docker/import/upload/latest.zip > /dev/null \
-    || { echo "ERROR: Backup zip failed integrity check — corrupt or incomplete. Aborting."; exit 1; }
+    || { echo "ERROR: Backup zip corrupt. Aborting."; exit 1; }
 
-  # Touch the file to update its modification time to the current time.
-  # This prevents Crafty's startup maintenance task from deleting it if the backup
-  # was created/uploaded to R2 more than 24 hours ago.
   touch /home/mcs/docker/import/upload/latest.zip
-
   echo "Backup downloaded and verified ($ZIPSIZE bytes)."
 
-  # Create .env for mc-restore.sh
   cat > /home/mcs/docker/.env << ENVFILE
 r2_endpoint=${r2_endpoint}
 r2_bucket=${r2_bucket}
 ENVFILE
 
-  # Create AWS credentials for mc-restore.sh
   mkdir -p /home/mcs/.aws
   cat > /home/mcs/.aws/credentials << AWSCREDS
 [default]
@@ -102,27 +133,92 @@ AWSCONF
   chown -R mcs:mcs /home/mcs/.aws
 fi
 
-# ─────────────────────────────────────────────────────────
-# SET OWNERSHIP & PERMISSIONS
-# chown first, then chmod to ensure correct final state
-# ─────────────────────────────────────────────────────────
 chown -R mcs:mcs /home/mcs/docker
-chmod 777 /home/mcs/docker/import/upload
+chmod 775 /home/mcs/docker/import/upload
 
-# ─────────────────────────────────────────────────────────
-# DEPLOY MC-RESTORE.SH
-# ─────────────────────────────────────────────────────────
 cat > /usr/local/bin/mc-restore.sh << 'RESTORE'
 ${mc_restore}
 RESTORE
 chmod +x /usr/local/bin/mc-restore.sh
 
-# ─────────────────────────────────────────────────────────
-# START DOCKER COMPOSE
-# Backup is already downloaded & verified at this point.
-# ─────────────────────────────────────────────────────────
+cat > /usr/local/bin/mc-backup-push.sh << 'BACKUPPUSH'
+#!/bin/bash
+# Trigger Crafty backup via API, then push to R2
+set -euo pipefail
+
+LOG=/var/log/mc-backup.log
+exec >> "$LOG" 2>&1
+echo "[backup $(date '+%Y-%m-%d %H:%M:%S')] Starting backup push..."
+
+ENV_FILE="/home/mcs/docker/.env"
+if [ ! -f "$ENV_FILE" ]; then echo "ERROR: .env missing"; exit 1; fi
+
+R2_ENDPOINT=$(grep r2_endpoint "$ENV_FILE" | cut -d= -f2-)
+R2_BUCKET=$(grep r2_bucket "$ENV_FILE" | cut -d= -f2-)
+
+CREDS_FILE="/home/mcs/docker/config/crafty-login.txt"
+if [ ! -f "$CREDS_FILE" ]; then echo "ERROR: crafty-login.txt missing"; exit 1; fi
+
+CRAFTY_PASS=$(grep '^password:' "$CREDS_FILE" | awk '{print $2}')
+
+LOGIN_PAYLOAD=$(jq -n --arg pass "$CRAFTY_PASS" '{"username":"admin","password":$pass}')
+LOGIN_RES=$(curl -s -k -X POST "https://127.0.0.1:8443/api/v2/auth/login" \
+  -H "Content-Type: application/json" \
+  -d "$LOGIN_PAYLOAD")
+TOKEN=$(echo "$LOGIN_RES" | jq -r '.data.token // empty')
+if [ -z "$TOKEN" ]; then echo "ERROR: Could not authenticate"; exit 1; fi
+
+SERVER_ID=$(curl -s -k "https://127.0.0.1:8443/api/v2/servers" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.data[0].server_id // empty')
+if [ -z "$SERVER_ID" ]; then echo "ERROR: No server found"; exit 1; fi
+
+curl -s -k -X POST "https://127.0.0.1:8443/api/v2/servers/$SERVER_ID/action/backup_server" \
+  -H "Authorization: Bearer $TOKEN" > /dev/null
+
+BACKUPS_DIR="/home/mcs/docker/backups"
+elapsed=0
+LATEST_ZIP=""
+while [ "$elapsed" -lt 120 ]; do
+  LATEST_ZIP=$(find "$BACKUPS_DIR" -name '*.zip' -newer /tmp/.last-backup-marker 2>/dev/null | head -1 || true)
+  if [ -n "$LATEST_ZIP" ]; then break; fi
+  sleep 5; elapsed=$((elapsed + 5))
+done
+
+touch /tmp/.last-backup-marker
+
+if [ -z "$LATEST_ZIP" ]; then
+  echo "WARNING: No new backup zip found after trigger. Skipping R2 upload."
+  exit 0
+fi
+
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+echo "Uploading $LATEST_ZIP to R2..."
+
+HOME=/home/mcs aws s3 cp "$LATEST_ZIP" "s3://$R2_BUCKET/latest.zip" \
+  --endpoint-url "$R2_ENDPOINT"
+HOME=/home/mcs aws s3 cp "$LATEST_ZIP" "s3://$R2_BUCKET/backups/$TIMESTAMP.zip" \
+  --endpoint-url "$R2_ENDPOINT"
+
+echo "[backup $(date '+%Y-%m-%d %H:%M:%S')] Upload complete: backups/$TIMESTAMP.zip"
+
+# Retain the last 10 timestamped backups in R2.
+HOME=/home/mcs aws s3 ls "s3://$R2_BUCKET/backups/" --endpoint-url "$R2_ENDPOINT" \
+  | sort | head -n -10 | awk '{print $NF}' | while read -r old; do
+    HOME=/home/mcs aws s3 rm "s3://$R2_BUCKET/backups/$old" --endpoint-url "$R2_ENDPOINT"
+    echo "Pruned old backup: $old"
+  done
+BACKUPPUSH
+chmod +x /usr/local/bin/mc-backup-push.sh
+
+echo "0 */6 * * * root /usr/local/bin/mc-backup-push.sh" > /etc/cron.d/mc-backup
+touch /tmp/.last-backup-marker
+
 cd /home/mcs/docker || { echo "ERROR: cannot cd to /home/mcs/docker"; exit 1; }
 docker compose up -d || { echo "ERROR: docker compose up -d failed"; exit 1; }
+
+sleep 5
+docker exec caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null \
+  || echo "WARNING: Caddy reload failed (may not be up yet — it will load correctly on start)"
 
 echo "Waiting for Crafty to start..."
 CREDS_WAIT=0
@@ -141,7 +237,6 @@ done
 if [ -f /home/mcs/docker/config/default-creds.txt ]; then
   CRAFTY_PASS=$(jq -r .password /home/mcs/docker/config/default-creds.txt)
 else
-  # Disable pipefail inside subshell to prevent SIGPIPE (exit code 141) from head/awk early exit
   CRAFTY_PASS=$(set +o pipefail; grep 'Your default admin password is:' /home/mcs/docker/logs/crafty.log \
     | grep -v 'Warning' | head -n1 | awk '{print $NF}' | tr -d '\r')
 fi
@@ -151,49 +246,71 @@ if [ -z "$CRAFTY_PASS" ]; then
   exit 1
 fi
 
-cat > /home/mcs/docker/config/crafty-login.txt << LOGIN
-username: admin
-password: $CRAFTY_PASS
-LOGIN
+{
+  printf 'username: admin\n'
+  printf 'password: %s\n' "$CRAFTY_PASS"
+} > /home/mcs/docker/config/crafty-login.txt
 chmod 600 /home/mcs/docker/config/crafty-login.txt
 chown mcs:mcs /home/mcs/docker/config/crafty-login.txt
 
 echo "Waiting for Crafty API to come up..."
+
 API_READY=0
 i=1
-while [ "$i" -le 60 ]
-do
-  # Write response to temp file; if file is non-empty, Crafty is answering
-  curl -s -k -o /tmp/crafty_probe.json \
+while [ "$i" -le 60 ]; do
+  CONTAINER_STATE=$(docker inspect -f '{{.State.Running}}' crafty_container 2>/dev/null || echo "false")
+  if [ "$CONTAINER_STATE" != "true" ]; then
+    echo "ERROR: crafty_container is not running. Docker logs:"
+    docker logs --tail 40 crafty_container 2>&1 || true
+    exit 1
+  fi
+
+  PROBE=$(docker exec crafty_container \
+    curl -s -k --max-time 5 -o /tmp/crafty_probe.json \
+    -w "%%{http_code}" \
     -X POST "https://127.0.0.1:8443/api/v2/auth/login" \
     -H "Content-Type: application/json" \
-    -d '{"username":"admin","password":"probe"}' 2>/dev/null || true
+    -d '{"username":"probe","password":"probe"}' 2>/dev/null || echo "000")
 
-  if [ -s /tmp/crafty_probe.json ]; then
-    echo "Crafty API is ready."
+  if [ "$PROBE" = "200" ] || [ "$PROBE" = "400" ] || [ "$PROBE" = "403" ]; then
+    echo "Crafty API is ready (HTTP $PROBE)."
     API_READY=1
     break
   fi
-  echo "API not ready yet, retrying in 5s... ($i/60)"
+
+  HOST_PROBE=$(curl -s -k --max-time 5 -o /dev/null \
+    -w "%%{http_code}" \
+    -X POST "https://127.0.0.1:8443/api/v2/auth/login" \
+    -H "Content-Type: application/json" \
+    -d '{"username":"probe","password":"probe"}' 2>/dev/null || echo "000")
+
+  if [ "$HOST_PROBE" = "200" ] || [ "$HOST_PROBE" = "400" ] || [ "$HOST_PROBE" = "403" ]; then
+    echo "Crafty API is ready on host port (HTTP $HOST_PROBE)."
+    API_READY=1
+    break
+  fi
+
+  echo "API not ready yet (container: $PROBE, host: $HOST_PROBE), retrying... ($i/60)"
   sleep 5
   i=$((i + 1))
 done
 
 if [ "$API_READY" -eq 0 ]; then
-  echo "ERROR: Crafty API did not become ready after 300s. Aborting."
+  echo "ERROR: Crafty API did not become ready after 300s."
+  docker logs --tail 50 crafty_container 2>&1 || true
+  docker ps -a 2>&1 || true
   exit 1
 fi
 
-# Retry login up to 3 times in case Crafty needs a moment after API comes up
 TOKEN=""
+LOGIN_RES=""
 for attempt in 1 2 3; do
+  LOGIN_PAYLOAD=$(jq -n --arg pass "$CRAFTY_PASS" '{"username":"admin","password":$pass}')
   LOGIN_RES=$(curl -s -k -X POST "https://127.0.0.1:8443/api/v2/auth/login" \
     -H "Content-Type: application/json" \
-    -d "{\"username\": \"admin\", \"password\": \"$CRAFTY_PASS\"}")
+    -d "$LOGIN_PAYLOAD")
   TOKEN=$(echo "$LOGIN_RES" | jq -r '.data.token // empty')
-  if [ -n "$TOKEN" ]; then
-    break
-  fi
+  if [ -n "$TOKEN" ]; then break; fi
   echo "Login attempt $attempt failed (response: $LOGIN_RES), retrying in 5s..."
   sleep 5
 done
@@ -203,10 +320,60 @@ if [ -z "$TOKEN" ]; then
   exit 1
 fi
 
+NEW_CRAFTY_PASS="crafty@123"
+
+USERS_RES=$(curl -s -k -X GET "https://127.0.0.1:8443/api/v2/users" \
+  -H "Authorization: Bearer $TOKEN")
+USER_ID=$(echo "$USERS_RES" | jq -r '.data[] | select(.username == "admin") | .user_id // empty' | head -1)
+if [ -z "$USER_ID" ]; then
+  echo "ERROR: Could not resolve admin user_id from /api/v2/users (response: $USERS_RES). Aborting."
+  exit 1
+fi
+
+echo "Changing admin password (user_id=$USER_ID)..."
+PATCH_PW_PAYLOAD=$(jq -n --arg pass "$NEW_CRAFTY_PASS" '{"password":$pass}')
+PATCH_PW_RES=$(curl -s -k -X PATCH "https://127.0.0.1:8443/api/v2/users/$USER_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "$PATCH_PW_PAYLOAD")
+PATCH_PW_STATUS=$(echo "$PATCH_PW_RES" | jq -r '.status // empty')
+if [ "$PATCH_PW_STATUS" != "ok" ]; then
+  echo "ERROR: Password change failed (response: $PATCH_PW_RES). Aborting."
+  exit 1
+fi
+
+echo "Re-authenticating with new password..."
+TOKEN=""
+for attempt in 1 2 3; do
+  REAUTH_PAYLOAD=$(jq -n --arg pass "$NEW_CRAFTY_PASS" '{"username":"admin","password":$pass}')
+  REAUTH_RES=$(curl -s -k -X POST "https://127.0.0.1:8443/api/v2/auth/login" \
+    -H "Content-Type: application/json" \
+    -d "$REAUTH_PAYLOAD")
+  TOKEN=$(echo "$REAUTH_RES" | jq -r '.data.token // empty')
+  if [ -n "$TOKEN" ]; then
+    echo "Re-auth successful."
+    break
+  fi
+  echo "Re-auth attempt $attempt failed, retrying in 5s..."
+  sleep 5
+done
+
+if [ -z "$TOKEN" ]; then
+  echo "ERROR: Re-authentication after password change failed. Aborting."
+  exit 1
+fi
+
+cat > /home/mcs/docker/config/crafty-login.txt << 'LOGIN'
+username: admin
+password: crafty@123
+LOGIN
+chmod 600 /home/mcs/docker/config/crafty-login.txt
+chown mcs:mcs /home/mcs/docker/config/crafty-login.txt
+echo "Password changed, re-auth confirmed, credentials stored."
+
 SERVERS_RES=$(curl -s -k -X GET "https://127.0.0.1:8443/api/v2/servers" \
   -H "Authorization: Bearer $TOKEN")
 
-# Verify the API returned a valid response before reading .data.length
 SERVERS_STATUS=$(echo "$SERVERS_RES" | jq -r '.status // empty' 2>/dev/null || echo "")
 if [ "$SERVERS_STATUS" != "ok" ]; then
   echo "ERROR: Could not list servers (response: $SERVERS_RES). Aborting."
@@ -226,19 +393,42 @@ if [ "$SERVER_EXIST" -eq 0 ]; then
 
   echo "Creating new Minecraft server by importing $ARCHIVE_NAME with Crafty..."
 
+  TOPLEVEL_DIRS=$(unzip -l "$IMPORT_ZIP" | tail -n +4 | head -n -2 | awk '{print $NF}' | cut -d/ -f1 | sort -u | grep -v '^$' | wc -l)
+  TOPLEVEL_NAME=$(unzip -l "$IMPORT_ZIP" | tail -n +4 | head -n -2 | awk '{print $NF}' | cut -d/ -f1 | sort -u | grep -v '^$' | head -1)
+
   archive_internal_path=""
-  # Disable pipefail inside subshell to prevent SIGPIPE (exit code 141) when awk exits early
-  jarfile=$(set +o pipefail; unzip -l "$IMPORT_ZIP" | awk '/forge-.*-server\.jar$/{print $NF; exit}')
-  if [ -z "$jarfile" ]; then
-    jarfile=$(set +o pipefail; unzip -l "$IMPORT_ZIP" | awk '/\.jar$/{print $NF; exit}')
+  if [ "$TOPLEVEL_DIRS" -eq 1 ] && [ -n "$TOPLEVEL_NAME" ]; then
+    TOTAL_ENTRIES=$(unzip -l "$IMPORT_ZIP" | tail -n +4 | head -n -2 | awk '{print $NF}' | grep -v '^$' | wc -l)
+    PREFIXED=$(unzip -l "$IMPORT_ZIP" | tail -n +4 | head -n -2 | awk '{print $NF}' | grep -v '^$' | grep "^$TOPLEVEL_NAME/" | wc -l)
+    if [ "$PREFIXED" -eq "$TOTAL_ENTRIES" ]; then
+      archive_internal_path="$TOPLEVEL_NAME"
+      echo "Detected archive prefix: $archive_internal_path"
+    fi
   fi
+
+  jarfile=""
+  jarfile=$(set +o pipefail; unzip -l "$IMPORT_ZIP" | awk '/forge-[0-9].*-server\.jar$/{print $NF; exit}')
+  if [ -z "$jarfile" ]; then
+    jarfile=$(set +o pipefail; unzip -l "$IMPORT_ZIP" | awk '/[Ss]erver.*\.jar$/{print $NF; exit}')
+  fi
+  if [ -z "$jarfile" ]; then
+    jarfile=$(set +o pipefail; unzip -v "$IMPORT_ZIP" | awk '/\.jar$/{print $1, $NF}' | sort -rn | head -1 | awk '{print $NF}')
+  fi
+
+  # Strip the archive_internal_path prefix from jarfile so Crafty receives
+  # a path relative to the server root, not the zip root.
+  # Terraform templatefile requires $${...} for runtime Bash expansion.
+  if [ -n "$archive_internal_path" ]; then
+    jarfile="$${jarfile#$archive_internal_path/}"
+  fi
+
   if [ -z "$jarfile" ]; then
     echo "ERROR: Could not find a server jar inside $IMPORT_ZIP. Aborting."
     exit 1
   fi
 
-  echo "Crafty import root: $archive_internal_path"
-  echo "Crafty import jar: $jarfile"
+  echo "Crafty import root: '$archive_internal_path'"
+  echo "Crafty import jar:  '$jarfile'"
 
   SERVER_PAYLOAD=$(jq -n \
     --arg archive_name "$ARCHIVE_NAME" \
@@ -247,7 +437,7 @@ if [ "$SERVER_EXIST" -eq 0 ]; then
     '{
       name: "Minecraft",
       autostart: true,
-      autostart_delay: 10,
+      autostart_delay: 60,
       monitoring_type: "minecraft_java",
       create_type: "minecraft_java",
       minecraft_java_monitoring_data: {
@@ -260,10 +450,9 @@ if [ "$SERVER_EXIST" -eq 0 ]; then
           archive_name: $archive_name,
           archive_internal_path: $archive_internal_path,
           jarfile: $jarfile,
-          mem_min: 1,
-          mem_max: 2,
-          server_properties_port: 25565,
-          agree_to_eula: true
+          mem_min: 2,
+          mem_max: 4,
+          server_properties_port: 25565
         }
       }
     }')
@@ -296,34 +485,170 @@ fi
 if [ -n "$SERVER_ID" ]; then
   echo "Waiting for Crafty import to complete..."
 
-  server_dir="/home/mcs/docker/servers/$SERVER_ID"
+  server_dir_container=$(curl -s -k "https://127.0.0.1:8443/api/v2/servers/$SERVER_ID" \
+    -H "Authorization: Bearer $TOKEN" | jq -r '.data.path // empty')
+
+  if [ -z "$server_dir_container" ]; then
+    server_dir_container="/crafty/servers/$SERVER_ID"
+    echo "WARNING: Could not get server path from API; using expected container path: $server_dir_container"
+  fi
+
+  server_dir_name="$${server_dir_container##*/}"
+  server_dir="/home/mcs/docker/servers/$${server_dir_name}"
+
+  echo "Container path: $server_dir_container"
+  echo "Host path:      $server_dir"
+
   max_wait=600
   elapsed=0
 
-  forge_args_file=""
-  while [ "$elapsed" -lt "$max_wait" ]
-  do
-    forge_args_file=$(find "$server_dir/libraries/net/minecraftforge/forge" -name unix_args.txt -print -quit 2>/dev/null || true)
-    if [ -f "$server_dir/user_jvm_args.txt" ] && [ -n "$forge_args_file" ]; then
+  while [ "$elapsed" -lt "$max_wait" ]; do
+    if [ -d "$server_dir" ] && [ -n "$(ls -A "$server_dir" 2>/dev/null)" ]; then
+      echo "Server directory populated, waiting 15s for extraction to finish..."
+      sleep 15
       break
     fi
     sleep 5
     elapsed=$((elapsed + 5))
-    echo "Still waiting for Forge... ($elapsed/$max_wait seconds)"
+    echo "Still waiting for server files... ($elapsed/$max_wait seconds)"
   done
 
+  if [ ! -d "$server_dir" ]; then
+    echo "ERROR: Crafty import did not complete within $max_wait seconds. Aborting."
+    exit 1
+  fi
+
+  echo "Crafty import completed."
+echo "Waiting 60 seconds for Crafty post-import processing..."
+sleep 60
+
+  # Write through the container so Crafty sees the right path and ownership.
+  echo "Writing eula=true inside container at $server_dir_container/eula.txt ..."
+  docker exec crafty_container \
+    sh -c "printf 'eula=true\n' > '$server_dir_container/eula.txt'" \
+    || { echo "ERROR: docker exec eula write failed. Aborting."; exit 1; }
+
+  EULA_CHECK=$(docker exec crafty_container \
+    cat "$server_dir_container/eula.txt" 2>/dev/null | tr -d '\r\n' || echo "")
+  if [ "$EULA_CHECK" != "eula=true" ]; then
+    echo "ERROR: eula.txt verification failed inside container (got: '$EULA_CHECK'). Aborting."
+    exit 1
+  fi
+  echo "EULA confirmed inside container (verified)."
+
+  # Java imports can leave Crafty's runtime server_path unset. Repair the DB
+  # path and patch agree_eula to reload it before calling the API action.
+  echo "Ensuring Crafty DB has server path before EULA API action..."
+  docker exec crafty_container python3 -c "import glob, sqlite3, sys; server_id=sys.argv[1]; server_path=sys.argv[2]; dbs=glob.glob('/crafty/app/config/**/*.sqlite', recursive=True)+glob.glob('/crafty/app/config/**/*.db', recursive=True); updated=False
+for db in dbs:
+    con=sqlite3.connect(db)
+    cur=con.cursor()
+    tables=[r[0] for r in cur.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")]
+    if 'servers' in tables:
+        cols=[r[1] for r in cur.execute('PRAGMA table_info(servers)')]
+        if 'server_id' in cols and 'path' in cols:
+            cur.execute('UPDATE servers SET path=? WHERE server_id=?', (server_path, server_id))
+            con.commit()
+            if cur.rowcount:
+                print(f'Updated {db}: servers.path={server_path}')
+                updated=True
+    con.close()
+if not updated:
+    raise SystemExit('ERROR: Could not update servers.path in Crafty DB')" \
+    "$SERVER_ID" "$server_dir_container" \
+    || { echo "ERROR: Crafty DB path repair failed. Aborting."; exit 1; }
+
+  echo "Patching Crafty EULA action to reload server_path when the runtime instance has None..."
+  docker exec crafty_container python3 -c "from pathlib import Path
+p=Path('/crafty/app/classes/shared/server.py')
+s=p.read_text()
+old='''    def agree_eula(self, user_id):
+        eula_file = os.path.join(self.server_path, \"eula.txt\")
+        with open(eula_file, \"w\", encoding=\"utf-8\") as f:
+            f.write(\"eula=true\")
+        self.run_threaded_server(user_id)
+'''
+new='''    def agree_eula(self, user_id):
+        if self.server_path is None:
+            self.reload_server_settings()
+            self.server_path = Helpers.get_os_understandable_path(self.settings[\"path\"])
+        eula_file = os.path.join(self.server_path, \"eula.txt\")
+        with open(eula_file, \"w\", encoding=\"utf-8\") as f:
+            f.write(\"eula=true\")
+        self.run_threaded_server(user_id)
+'''
+if new not in s:
+    if old not in s:
+        raise SystemExit('ERROR: Could not find Crafty agree_eula block to patch')
+    p.write_text(s.replace(old, new))
+    print('Patched Crafty agree_eula server_path fallback')
+else:
+    print('Crafty agree_eula server_path fallback already patched')" \
+    || { echo "ERROR: Crafty EULA runtime patch failed. Aborting."; exit 1; }
+
+  echo "Restarting Crafty so server instances reload the repaired path and patched EULA action..."
+  docker restart crafty_container >/dev/null \
+    || { echo "ERROR: Failed to restart Crafty after DB path repair. Aborting."; exit 1; }
+
+  echo "Waiting for Crafty API after restart..."
+  API_READY=0
+  for i in $(seq 1 60); do
+    PROBE=$(curl -s -k --max-time 5 -o /dev/null \
+      -w "%%{http_code}" \
+      -X POST "https://127.0.0.1:8443/api/v2/auth/login" \
+      -H "Content-Type: application/json" \
+      -d '{"username":"probe","password":"probe"}' 2>/dev/null || echo "000")
+    if [ "$PROBE" = "200" ] || [ "$PROBE" = "400" ] || [ "$PROBE" = "403" ]; then
+      API_READY=1
+      break
+    fi
+    echo "Crafty API not ready after restart (HTTP $PROBE), retrying... ($i/60)"
+    sleep 5
+  done
+  if [ "$API_READY" -eq 0 ]; then
+    echo "ERROR: Crafty API did not become ready after DB path repair restart. Aborting."
+    docker logs --tail 50 crafty_container 2>&1 || true
+    exit 1
+  fi
+
+  echo "Re-authenticating after Crafty restart..."
+  TOKEN=""
+  for attempt in 1 2 3; do
+    REAUTH_PAYLOAD=$(jq -n --arg pass "$NEW_CRAFTY_PASS" '{"username":"admin","password":$pass}')
+    REAUTH_RES=$(curl -s -k -X POST "https://127.0.0.1:8443/api/v2/auth/login" \
+      -H "Content-Type: application/json" \
+      -d "$REAUTH_PAYLOAD")
+    TOKEN=$(echo "$REAUTH_RES" | jq -r '.data.token // empty')
+    if [ -n "$TOKEN" ]; then
+      break
+    fi
+    echo "Post-restart re-auth attempt $attempt failed, retrying in 5s..."
+    sleep 5
+  done
+  if [ -z "$TOKEN" ]; then
+    echo "ERROR: Could not re-authenticate after Crafty restart. Aborting."
+    exit 1
+  fi
+
+  echo "Accepting EULA through Crafty API..."
+  echo "SERVER_ID=$SERVER_ID"
+  EULA_RES=$(curl -s -k -X POST \
+    "https://127.0.0.1:8443/api/v2/servers/$SERVER_ID/action/eula/" \
+    -H "Authorization: Bearer $TOKEN")
+  echo "EULA response: $EULA_RES"
+  EULA_STATUS=$(echo "$EULA_RES" | jq -r '.status // empty' 2>/dev/null || echo "")
+  if [ "$EULA_STATUS" != "ok" ]; then
+    echo "ERROR: Crafty EULA acceptance failed"
+    exit 1
+  fi
+  echo "Crafty EULA accepted through API."
+
+  chown -R mcs:mcs "$server_dir" || true
+
+  forge_args_file=$(find "$server_dir/libraries/net/minecraftforge/forge" -name unix_args.txt -print -quit 2>/dev/null || true)
   if [ -f "$server_dir/user_jvm_args.txt" ] && [ -n "$forge_args_file" ]; then
-    echo "Crafty Forge import completed."
-
-    echo "eula=true" > "$server_dir/eula.txt"
-    chown -R mcs:mcs "$server_dir"
-    echo "EULA accepted."
-
-    # Dynamically resolve the Forge unix_args.txt path relative to server_dir
-    # instead of hardcoding a specific Forge version
     forge_args_relative="$${forge_args_file#$server_dir/}"
     echo "Resolved Forge args path: $forge_args_relative"
-
     exec_command="java @user_jvm_args.txt @$${forge_args_relative} nogui \"\$@\""
     exec_payload=$(jq -n --arg execution_command "$exec_command" '{execution_command: $execution_command}')
 
@@ -336,29 +661,29 @@ if [ -n "$SERVER_ID" ]; then
       echo "ERROR: Failed to set Forge execution command (response: $UPDATE_RES). Aborting."
       exit 1
     fi
-    echo "Forge execution command set: $exec_command"
+  fi
 
-    AUTO_RES=$(curl -s -k -X PATCH "https://127.0.0.1:8443/api/v2/servers/$SERVER_ID" \
-      -H "Authorization: Bearer $TOKEN" \
-      -H "Content-Type: application/json" \
-      -d '{"auto_start": true, "auto_start_delay": 10}')
-    AUTO_STATUS=$(echo "$AUTO_RES" | jq -r '.status // empty')
-    if [ "$AUTO_STATUS" != "ok" ]; then
-      echo "ERROR: Failed to enable autostart (response: $AUTO_RES). Aborting."
-      exit 1
-    fi
-    echo "Autostart enabled."
+  echo "Starting Server $SERVER_ID..."
+  START_RES=$(curl -s -k -X POST \
+    "https://127.0.0.1:8443/api/v2/servers/$SERVER_ID/action/start_server" \
+    -H "Authorization: Bearer $TOKEN")
+  echo "Server start command sent (response: $START_RES)."
 
-    echo "Starting Server $SERVER_ID..."
-    START_RES=$(curl -s -k -X POST \
-      "https://127.0.0.1:8443/api/v2/servers/$SERVER_ID/action/start_server" \
-      -H "Authorization: Bearer $TOKEN")
-    echo "Server start command sent (response: $START_RES)."
-
-  else
-    echo "ERROR: Crafty Forge import did not complete within $max_wait seconds. Aborting."
+  sleep 3
+  AUTO_RES=$(curl -s -k -X PATCH "https://127.0.0.1:8443/api/v2/servers/$SERVER_ID" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"auto_start": true, "auto_start_delay": 60}')
+  AUTO_STATUS=$(echo "$AUTO_RES" | jq -r '.status // empty')
+  if [ "$AUTO_STATUS" != "ok" ]; then
+    echo "ERROR: Failed to enable autostart (response: $AUTO_RES). Aborting."
     exit 1
   fi
+  echo "Autostart enabled (delay: 60s)."
 fi
 
+touch "$DEPLOY_MARKER"
+chown mcs:mcs "$DEPLOY_MARKER"
+
 echo "Deployment complete at $(date)."
+echo "Crafty credentials stored at: /home/mcs/docker/config/crafty-login.txt"
