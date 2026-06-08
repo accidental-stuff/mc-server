@@ -59,6 +59,9 @@ if [ ! -f /swapfile ]; then
   echo "Swap enabled."
 fi
 
+# Caddy reverse-proxies to Crafty on the internal Docker network.
+# tls_insecure_skip_verify is safe here — traffic never leaves the host,
+# and Crafty 8443 is bound to 127.0.0.1. Caddy terminates public TLS.
 cat > /home/mcs/docker/caddy/Caddyfile << 'CADDYFILE'
 ${crafty_domain} {
     reverse_proxy crafty_container:8443 {
@@ -115,7 +118,6 @@ if [ -n "${r2_access_key}" ] && [ -n "${r2_secret_key}" ]; then
   echo "Backup downloaded and verified ($ZIPSIZE bytes)."
 
   cat > /home/mcs/docker/.env << ENVFILE
-r2_endpoint=${r2_endpoint}
 r2_bucket=${r2_bucket}
 ENVFILE
 
@@ -141,77 +143,10 @@ ${mc_restore}
 RESTORE
 chmod +x /usr/local/bin/mc-restore.sh
 
-cat > /usr/local/bin/mc-backup-push.sh << 'BACKUPPUSH'
-#!/bin/bash
-# Trigger Crafty backup via API, then push to R2
-set -euo pipefail
-
-LOG=/var/log/mc-backup.log
-exec >> "$LOG" 2>&1
-echo "[backup $(date '+%Y-%m-%d %H:%M:%S')] Starting backup push..."
-
-ENV_FILE="/home/mcs/docker/.env"
-if [ ! -f "$ENV_FILE" ]; then echo "ERROR: .env missing"; exit 1; fi
-
-R2_ENDPOINT=$(grep r2_endpoint "$ENV_FILE" | cut -d= -f2-)
-R2_BUCKET=$(grep r2_bucket "$ENV_FILE" | cut -d= -f2-)
-
-CREDS_FILE="/home/mcs/docker/config/crafty-login.txt"
-if [ ! -f "$CREDS_FILE" ]; then echo "ERROR: crafty-login.txt missing"; exit 1; fi
-
-CRAFTY_PASS=$(grep '^password:' "$CREDS_FILE" | awk '{print $2}')
-
-LOGIN_PAYLOAD=$(jq -n --arg pass "$CRAFTY_PASS" '{"username":"admin","password":$pass}')
-LOGIN_RES=$(curl -s -k -X POST "https://127.0.0.1:8443/api/v2/auth/login" \
-  -H "Content-Type: application/json" \
-  -d "$LOGIN_PAYLOAD")
-TOKEN=$(echo "$LOGIN_RES" | jq -r '.data.token // empty')
-if [ -z "$TOKEN" ]; then echo "ERROR: Could not authenticate"; exit 1; fi
-
-SERVER_ID=$(curl -s -k "https://127.0.0.1:8443/api/v2/servers" \
-  -H "Authorization: Bearer $TOKEN" | jq -r '.data[0].server_id // empty')
-if [ -z "$SERVER_ID" ]; then echo "ERROR: No server found"; exit 1; fi
-
-curl -s -k -X POST "https://127.0.0.1:8443/api/v2/servers/$SERVER_ID/action/backup_server" \
-  -H "Authorization: Bearer $TOKEN" > /dev/null
-
-BACKUPS_DIR="/home/mcs/docker/backups"
-elapsed=0
-LATEST_ZIP=""
-while [ "$elapsed" -lt 120 ]; do
-  LATEST_ZIP=$(find "$BACKUPS_DIR" -name '*.zip' -newer /tmp/.last-backup-marker 2>/dev/null | head -1 || true)
-  if [ -n "$LATEST_ZIP" ]; then break; fi
-  sleep 5; elapsed=$((elapsed + 5))
-done
-
-touch /tmp/.last-backup-marker
-
-if [ -z "$LATEST_ZIP" ]; then
-  echo "WARNING: No new backup zip found after trigger. Skipping R2 upload."
-  exit 0
-fi
-
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-echo "Uploading $LATEST_ZIP to R2..."
-
-HOME=/home/mcs aws s3 cp "$LATEST_ZIP" "s3://$R2_BUCKET/latest.zip" \
-  --endpoint-url "$R2_ENDPOINT"
-HOME=/home/mcs aws s3 cp "$LATEST_ZIP" "s3://$R2_BUCKET/backups/$TIMESTAMP.zip" \
-  --endpoint-url "$R2_ENDPOINT"
-
-echo "[backup $(date '+%Y-%m-%d %H:%M:%S')] Upload complete: backups/$TIMESTAMP.zip"
-
-# Retain the last 10 timestamped backups in R2.
-HOME=/home/mcs aws s3 ls "s3://$R2_BUCKET/backups/" --endpoint-url "$R2_ENDPOINT" \
-  | sort | head -n -10 | awk '{print $NF}' | while read -r old; do
-    HOME=/home/mcs aws s3 rm "s3://$R2_BUCKET/backups/$old" --endpoint-url "$R2_ENDPOINT"
-    echo "Pruned old backup: $old"
-  done
-BACKUPPUSH
-chmod +x /usr/local/bin/mc-backup-push.sh
-
-echo "0 */6 * * * root /usr/local/bin/mc-backup-push.sh" > /etc/cron.d/mc-backup
-touch /tmp/.last-backup-marker
+cat > /usr/local/bin/mc-backup-sync.sh << 'BACKUPSYNC'
+${mc_backup_sync}
+BACKUPSYNC
+chmod +x /usr/local/bin/mc-backup-sync.sh
 
 cd /home/mcs/docker || { echo "ERROR: cannot cd to /home/mcs/docker"; exit 1; }
 docker compose up -d || { echo "ERROR: docker compose up -d failed"; exit 1; }
@@ -681,6 +616,91 @@ else:
   fi
   echo "Autostart enabled (delay: 60s)."
 fi
+
+# ── Create Crafty daily backup schedule ──────────────────
+echo "Creating daily backup schedule in Crafty..."
+# Look up the default backup config ID so the schedule links to it
+BACKUP_ID=$(docker exec crafty_container python3 -c "
+import sqlite3
+con = sqlite3.connect('/crafty/app/config/db/crafty.sqlite')
+row = con.execute('SELECT backup_id FROM backups WHERE server_id=? AND \"default\"=1', ('$SERVER_ID',)).fetchone()
+print(row[0] if row else '')
+con.close()
+" 2>/dev/null)
+echo "Backup config ID: $${BACKUP_ID:-not found}"
+
+SCHEDULE_PAYLOAD=$(jq -n \
+  --arg name "Daily Backup to R2" \
+  --arg action_id "$${BACKUP_ID:-}" \
+  '{
+    name: $name,
+    enabled: true,
+    action: "backup",
+    action_id: $action_id,
+    interval: 1,
+    interval_type: "days",
+    start_time: "04:00",
+    one_time: false,
+    command: "backup_server",
+    cron_string: "",
+    delay: 0
+  }')
+SCHEDULE_RES=$(curl -s -k -X POST "https://127.0.0.1:8443/api/v2/servers/$SERVER_ID/tasks" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "$SCHEDULE_PAYLOAD")
+SCHEDULE_STATUS=$(echo "$SCHEDULE_RES" | jq -r '.status // empty' 2>/dev/null || echo "")
+if [ "$SCHEDULE_STATUS" = "ok" ]; then
+  echo "Daily backup schedule created successfully."
+else
+  echo "WARNING: Failed to create backup schedule (response: $SCHEDULE_RES)."
+fi
+
+# ── Configure Default Backup (shutdown + compress) ───────
+echo "Configuring default backup settings..."
+docker exec crafty_container python3 -c "
+import sqlite3
+con = sqlite3.connect('/crafty/app/config/db/crafty.sqlite')
+cur = con.cursor()
+cur.execute('UPDATE backups SET shutdown=1, compress=1, max_backups=3 WHERE server_id=? AND \"default\"=1', ('$SERVER_ID',))
+con.commit()
+con.close()
+print('Backup config updated.')
+" && echo "Default backup configured (shutdown=1, compress=1, max_backups=3)." \
+  || echo "WARNING: Failed to update backup config."
+
+# ── Create systemd timer for R2 sync ─────────────────────
+cat > /etc/systemd/system/mc-backup-sync.service << 'SVCUNIT'
+[Unit]
+Description=Sync Crafty backups to R2
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mc-backup-sync.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mc-backup-sync
+SVCUNIT
+
+cat > /etc/systemd/system/mc-backup-sync.timer << 'TMRUNIT'
+[Unit]
+Description=Run mc-backup-sync every 5 minutes
+Requires=mc-backup-sync.service
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=false
+Unit=mc-backup-sync.service
+
+[Install]
+WantedBy=timers.target
+TMRUNIT
+
+systemctl daemon-reload
+systemctl enable --now mc-backup-sync.timer
+echo "Backup sync timer installed and started."
 
 touch "$DEPLOY_MARKER"
 chown mcs:mcs "$DEPLOY_MARKER"

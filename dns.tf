@@ -5,7 +5,8 @@ resource "cloudflare_record" "minecraft" {
   content = google_compute_address.minecraft.address
   type    = "A"
   proxied = false 
-  ttl     = 60
+  ttl     = 300
+  allow_overwrite = true
 }
 
 # SRV record — lets players connect with just "yourdomain.com" (no :25565)
@@ -13,7 +14,8 @@ resource "cloudflare_record" "minecraft_srv" {
   zone_id = var.cloudflare_zone_id
   name    = "_minecraft._tcp"
   type    = "SRV"
-  ttl     = 60
+  ttl     = 300
+  allow_overwrite = true
   data {
     service  = "_minecraft"
     proto    = "_tcp"
@@ -32,5 +34,6 @@ resource "cloudflare_record" "crafty" {
   content = google_compute_address.minecraft.address
   type    = "A"
   proxied = false 
-  ttl     = 60
+  ttl     = 300
+  allow_overwrite = true
 }

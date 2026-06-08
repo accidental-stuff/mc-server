@@ -75,6 +75,7 @@ resource "google_compute_instance" "minecraft" {
       r2_bucket      = var.r2_bucket
       docker_compose = file("${path.module}/scripts/docker-compose.yml")
       mc_restore     = file("${path.module}/scripts/mc-restore.sh")
+      mc_backup_sync = file("${path.module}/scripts/mc-backup-sync.sh")
       crafty_domain  = "${var.crafty_subdomain}.${var.domain}"
     })
   })

@@ -21,7 +21,7 @@ if [ ! -f "$ENV_FILE" ]; then
   exit 1
 fi
 
-R2_ENDPOINT=$(grep r2_endpoint "$ENV_FILE" 2>/dev/null | cut -d= -f2- || echo "")
+R2_ENDPOINT=$(awk -F'=' '/endpoint_url/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' /home/mcs/.aws/config 2>/dev/null || echo "")
 R2_BUCKET=$(grep r2_bucket "$ENV_FILE" 2>/dev/null | cut -d= -f2- || echo "mc-server-backup")
 
 SERVERS_DIR="/home/mcs/docker/servers"
@@ -61,7 +61,7 @@ HOME=/home/mcs aws s3 cp \
 CREDS_FILE="/home/mcs/docker/config/crafty-login.txt"
 if [ -f "$CREDS_FILE" ]; then
   log "Attempting graceful Minecraft server shutdown via Crafty API..."
-  CRAFTY_PASS=$(grep '^password:' "$CREDS_FILE" | awk '{print $2}' || echo "")
+  CRAFTY_PASS=$(awk -F': ' '/^password:/ {print $2; exit}' "$CREDS_FILE" || echo "")
 
   if [ -n "$CRAFTY_PASS" ]; then
     LOGIN_RES=$(curl -s -k --max-time 10 -X POST "https://127.0.0.1:8443/api/v2/auth/login" \

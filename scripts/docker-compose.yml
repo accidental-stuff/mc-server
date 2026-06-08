@@ -16,6 +16,12 @@ services:
       - /home/mcs/docker/servers:/crafty/servers
       - /home/mcs/docker/config:/crafty/app/config
       - /home/mcs/docker/import:/crafty/import
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.settimeout(3); s.connect(('localhost',8443)); s.close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
 
   caddy:
     image: caddy:2
@@ -29,4 +35,5 @@ services:
       - /home/mcs/docker/caddy/data:/data
       - /home/mcs/docker/caddy/config:/config
     depends_on:
-      - crafty
+      crafty:
+        condition: service_healthy
