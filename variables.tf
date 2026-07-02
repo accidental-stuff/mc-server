@@ -142,11 +142,10 @@ variable "crafty_admin_password" {
   description = "Admin password for the Crafty control panel"
   type        = string
   sensitive   = true
-  default     = "crafty@123"
   nullable    = false
 
   validation {
-    condition     = length(var.crafty_admin_password) >= 8
-    error_message = "crafty_admin_password must be at least 8 characters."
+    condition     = length(var.crafty_admin_password) >= 8 && var.crafty_admin_password != "crafty@123"
+    error_message = "crafty_admin_password must be at least 8 characters and must not use the old default password."
   }
 }
